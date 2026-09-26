@@ -1,7 +1,39 @@
 # Bulk Transfer Engineering Exercise
 
 Scala 2 implementation of a company's backend engineering exercise. Sprint 1 established the behavioural
-contract before choosing an implementation architecture.
+contract before choosing an implementation architecture. Sprint 2 implements a narrow HTTP-to-
+SQLite walking slice.
+
+## Run
+
+The service uses JDK 21, Scala 2.13, and sbt through `mise`:
+
+```sh
+mise install
+mise exec -- sbt test
+DATABASE_PATH=/path/to/demo_accounts.sqlite mise exec -- sbt run
+```
+
+It listens on port `8080` by default; set `PORT` to override it. On an empty database the service
+creates its tables but deliberately does not invent a customer account. Tests create and seed an
+isolated temporary database.
+
+## Architecture
+
+The first slice uses http4s/Circe for HTTP and JSON, Cats Effect for resource lifecycle, and doobie
+with the Xerial SQLite driver for persistence. These are established Scala libraries and keep the
+implementation on Scala 2 without introducing an application framework.
+
+The flow is deliberately small:
+
+```text
+HTTP/JSON -> pure normalization and validation -> one transactional batch operation -> HTTP result
+```
+
+The database operation conditionally debits the account and inserts every negative ledger entry in
+one transaction. HTTP and persistence are separated because they change for different reasons;
+additional layers or per-class interfaces would not yet earn their complexity. Idempotency replay,
+concurrency verification, and operational limits remain Sprint 3 work.
 
 ## Method
 

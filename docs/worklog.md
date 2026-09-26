@@ -32,3 +32,28 @@ personal names were removed; supplied assets were reclassified as illustrative i
 were clarified as consistent with outgoing transfers; and response and normalization questions were
 narrowed. Canonical amount syntax and a required client idempotency key were accepted. Limits and
 response bodies remain open. Time awaiting review is not counted as active project time.
+
+## Sprint 2 — Minimal architecture and walking slice
+
+- **Active time:** Approximately 1h 10m
+- **Goal:** Choose a proportionate Scala stack, define only the boundaries needed for correctness,
+  and implement one executable request-to-persistence path.
+- **Scope:** Application structure, request decoding, domain validation, controlled database setup,
+  and the basic accepted/rejected flow.
+- **Deferred to Sprint 3:** Concurrency proof, crash behavior, idempotent replay, operational limits,
+  and production hardening.
+- **Current checkpoint:** A real HTTP request now passes through contract decoding, pure validation,
+  and one SQLite transaction. Integration tests prove both an accepted batch and a rejected
+  insufficient-funds batch against isolated state. Unknown-account and missing/blank idempotency-key
+  paths are also covered without financial side effects. Idempotent replay is intentionally not yet
+  implemented.
+- **Outcome:** Complete. The executable walking slice establishes the minimum architecture needed
+  to test the contract while leaving concurrency and retry hardening for Sprint 3.
+
+## Sprint 3 note
+
+Evaluate whether `ETag`/`If-Match` adds useful optimistic concurrency semantics. Keep it distinct
+from `Idempotency-Key`: a version precondition can detect stale account state, but cannot safely
+replay a request after its response is lost. For a production database, replace the direct
+DriverManager transactor with a managed, pool-backed transactor; the direct SQLite connection is
+proportionate for this exercise.
