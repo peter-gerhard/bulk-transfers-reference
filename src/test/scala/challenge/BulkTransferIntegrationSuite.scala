@@ -12,7 +12,7 @@ import org.typelevel.ci.CIString
 import org.typelevel.doobie.Transactor
 import org.typelevel.doobie.implicits._
 
-class WalkingSliceSuite extends munit.FunSuite {
+class BulkTransferIntegrationSuite extends munit.FunSuite {
   test("an affordable HTTP batch debits the account and persists every transfer") {
     withDatabase { transactor =>
       val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
