@@ -7,8 +7,8 @@ import com.comcast.ip4s.{Host, Port}
 import org.http4s.ember.server.EmberServerBuilder
 
 object Main extends IOApp.Simple {
-  private val databasePath = sys.env.getOrElse("DATABASE_PATH", "bulk-transfers.sqlite")
-  private val port = sys.env.get("PORT").flatMap(_.toIntOption).getOrElse(8080)
+  private val databasePath = sys.env.getOrElse("CHALLENGE_DATABASE_PATH", "bulk-transfers.sqlite")
+  private val port = sys.env.get("CHALLENGE_PORT").flatMap(_.toIntOption).getOrElse(8080)
 
   override val run: IO[Unit] = {
     val transactor = Database.transactor(databasePath)

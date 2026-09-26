@@ -1,0 +1,169 @@
+openapi: 3.0.3
+info:
+  title: Bulk Transfer API
+  version: 0.1.0
+  description: Submit an atomic batch of outgoing EUR transfers for one account.
+servers:
+  - url: http://localhost:8080
+paths:
+  /transfers/bulk:
+    post:
+      summary: Create a bulk transfer
+      operationId: createBulkTransfer
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: >-
+            Identifies one logical request. A successful retry with the same normalized body
+            replays the result; using the key for different content returns 409.
+          schema:
+            type: string
+            pattern: '.*\S.*'
+            example: review-1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BulkTransferRequest'
+            example:
+              organization_bic: DEMOBIC
+              organization_iban: FR761234
+              credit_transfers:
+                - amount: '14.50'
+                  currency: EUR
+                  counterparty_bic: DEUTDEFF
+                  counterparty_iban: DE893704
+                  counterparty_name: Supplier A
+                  description: Invoice A
+      responses:
+        '201':
+          description: All transfers were persisted and the account was debited atomically.
+        '400':
+          description: The JSON, header, or request fields are invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missingIdempotencyKey:
+                  summary: Missing or blank idempotency key
+                  value:
+                    code: idempotency_key_required
+                malformedJson:
+                  summary: Malformed or structurally invalid JSON
+                  value:
+                    code: invalid_request_body
+                invalidBatch:
+                  summary: Valid JSON that violates the request rules
+                  value:
+                    code: invalid_request
+        '404':
+          description: No account matches the normalized organization BIC and IBAN.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: account_not_found
+        '409':
+          description: The idempotency key is already bound to different request content.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: idempotency_key_conflict
+        '422':
+          description: The account cannot fund the entire batch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: insufficient_funds
+        '500':
+          description: An unexpected server or persistence failure occurred.
+components:
+  schemas:
+    BulkTransferRequest:
+      type: object
+      required:
+        - organization_bic
+        - organization_iban
+        - credit_transfers
+      properties:
+        organization_bic:
+          type: string
+          description: >-
+            BIC of the account to debit. Spaces are removed and letters normalized to uppercase;
+            the current implementation does not otherwise validate BIC structure.
+          example: DEMOBIC
+        organization_iban:
+          type: string
+          description: >-
+            IBAN of the account to debit. Spaces are removed and letters normalized to uppercase;
+            the current implementation does not validate country length or checksum.
+          example: FR761234
+        credit_transfers:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/CreditTransfer'
+    CreditTransfer:
+      type: object
+      required:
+        - amount
+        - currency
+        - counterparty_bic
+        - counterparty_iban
+        - counterparty_name
+        - description
+      properties:
+        amount:
+          type: string
+          description: Positive EUR amount with one or two optional decimal places, within signed 64-bit cents.
+          pattern: '^[ \t\r\n]*[0-9]+(?:\.[0-9]{1,2})?[ \t\r\n]*$'
+          example: '14.50'
+        currency:
+          type: string
+          enum:
+            - EUR
+          example: EUR
+        counterparty_bic:
+          type: string
+          description: >-
+            External BIC. Spaces are removed and letters normalized to uppercase; the current
+            implementation does not otherwise validate BIC structure or existence.
+          example: DEUTDEFF
+        counterparty_iban:
+          type: string
+          description: >-
+            External IBAN. Spaces are removed and letters normalized to uppercase; the current
+            implementation does not validate country length, checksum, or existence.
+          example: DE893704
+        counterparty_name:
+          type: string
+          example: Supplier A
+        description:
+          type: string
+          example: Invoice A
+    ErrorResponse:
+      type: object
+      required:
+        - code
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+    ErrorCode:
+      type: string
+      description: Stable machine-readable error identifier.
+      enum:
+        - idempotency_key_required
+        - invalid_request_body
+        - invalid_request
+        - account_not_found
+        - idempotency_key_conflict
+        - insufficient_funds
+      example: insufficient_funds

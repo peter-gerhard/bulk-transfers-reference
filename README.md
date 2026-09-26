@@ -1,8 +1,8 @@
-# Bulk Transfer Engineering Exercise
+# Bulk Transfer Service
 
-Scala 2 implementation of a company's backend engineering exercise. Sprint 1 established the behavioural
-contract before choosing an implementation architecture. Sprint 2 implements a narrow HTTP-to-
-SQLite walking slice.
+Scala 2 implementation of a backend engineering exercise. The solution grew from an explicit behavioural
+contract into a narrow HTTP-to-SQLite slice, then added retry and concurrency correctness without
+expanding the architecture unnecessarily.
 
 ## Run
 
@@ -11,16 +11,65 @@ The service uses JDK 21, Scala 2.13, and sbt through `mise`:
 ```sh
 mise install
 mise exec -- sbt test
-DATABASE_PATH=/path/to/demo_accounts.sqlite mise exec -- sbt run
+CHALLENGE_DATABASE_PATH=/tmp/bulk-transfers-demo.sqlite mise exec -- sbt run
 ```
 
-It listens on port `8080` by default; set `PORT` to override it. On an empty database the service
-creates its tables but deliberately does not invent a customer account. Tests create and seed an
-isolated temporary database.
+It listens on port `8080` by default; set `CHALLENGE_PORT` to override it. The database defaults to
+`bulk-transfers.sqlite`; set `CHALLENGE_DATABASE_PATH` to use another path. On an empty database the
+service creates its tables but deliberately does not invent a customer account. Tests create and
+seed an isolated temporary database.
+
+### Manual demo
+
+Start the service with a clean demo database:
+
+```sh
+rm -f /tmp/bulk-transfers-demo.sqlite
+CHALLENGE_DATABASE_PATH=/tmp/bulk-transfers-demo.sqlite mise exec -- sbt run
+```
+
+After the server has started, seed one account from another terminal:
+
+```sh
+sqlite3 /tmp/bulk-transfers-demo.sqlite \
+  "INSERT INTO bank_accounts (id, organization_name, balance_cents, iban, bic) VALUES (1, 'Demo', 10000, 'FR761234', 'DEMOBIC');"
+```
+
+Submit a transfer:
+
+```sh
+curl -i http://localhost:8080/transfers/bulk \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: review-1' \
+  --data '{
+    "organization_bic": "DEMOBIC",
+    "organization_iban": "FR761234",
+    "credit_transfers": [{
+      "amount": "14.50",
+      "currency": "EUR",
+      "counterparty_bic": "DEUTDEFF",
+      "counterparty_iban": "DE893704",
+      "counterparty_name": "Supplier A",
+      "description": "Invoice A"
+    }]
+  }'
+```
+
+The response is `201 Created`. Repeating the same command with the same idempotency key also returns
+`201` without applying the debit again. The persisted result can be inspected directly:
+
+```sh
+sqlite3 /tmp/bulk-transfers-demo.sqlite \
+  "SELECT balance_cents, (SELECT COUNT(*) FROM transactions) FROM bank_accounts WHERE id = 1;"
+# 8550|1
+```
+
+The integration tests provide broader executable evidence for insufficient funds, validation,
+retry, concurrency, and rollback behaviour.
 
 ## Architecture
 
-The first slice uses http4s/Circe for HTTP and JSON, Cats Effect for resource lifecycle, and doobie
+The service uses http4s/Circe for HTTP and JSON, Cats Effect for resource lifecycle, and doobie
 with the Xerial SQLite driver for persistence. These are established Scala libraries and keep the
 implementation on Scala 2 without introducing an application framework.
 
@@ -46,12 +95,13 @@ keep the solution proportional to the problem while making financial correctness
 ## Contract
 
 `POST /transfers/bulk` receives a batch of outgoing transfers for one account, identified by BIC
-and IBAN.
+and IBAN. The implemented HTTP contract is also available as [`openapi.yaml`](openapi.yaml).
 
 - A request is accepted only when the account can fund the entire batch.
 - Acceptance persists every debit and deducts the exact total atomically.
 - Insufficient funds returns `422` and changes nothing.
 - Success returns `201`.
+- Errors return a stable machine-readable `code`.
 - Correctness must hold across concurrent, load-balanced instances and unexpected process, client,
   network, or database failures.
 - Monetary calculations must be exact to the cent.
@@ -112,20 +162,6 @@ SQLite serializes writers, so this is a scalability limit of the exercise setup;
 database can allow unrelated accounts and keys to proceed concurrently, while requests against the
 same account must still contend on that account's balance.
 
-## Open decisions
-
-- **Limits:** A finite batch and field-size limit is needed, but the value should be justified by
-  transaction duration, lock contention, throughput, latency objectives, and database limits rather
-  than guessed. It should be configurable and tested at its boundary.
-- **Response body:** No body is required by the supplied contract. A stable machine-readable error
-  code would help clients. Returning the available balance is not currently proposed because it is
-  sensitive, immediately stale under concurrency, and may encourage race-prone client behaviour.
-- **Database invariants:** The supplied SQLite schema has few constraints. The solution may strengthen
-  its own schema or migrations where an invariant can be defended; the sample schema is not treated
-  as immutable or canonical.
-- **Idempotency retention:** Stored keys need an expiry and cleanup policy in production. Its duration
-  should follow the client's maximum retry window rather than an arbitrary exercise value.
-
 ## Acceptance criteria
 
 1. An affordable batch returns `201`; every debit is persisted and the exact total is deducted.
@@ -142,13 +178,25 @@ same account must still contend on that account's balance.
 8. Tests run from isolated, repeatable state rather than mutating the supplied sample database.
 9. Build, run, test, assumptions, trade-offs, and known production limitations are documented.
 
-## Primary risks
+## Production limitations and future improvements
 
-- Race conditions between balance validation and update.
-- Partial persistence when a process or database operation fails.
-- Duplicate effects after an ambiguous client retry.
-- Rounding or overflow in monetary parsing and aggregation.
-- Assuming SQLite locking behaviour is equivalent to a production relational database.
-- Excessive transaction duration or resource use for an unbounded batch.
-- SQLite's single-writer model is not representative of the concurrency available from a
-  production relational database.
+The original correctness risks—stale balance decisions, partial writes, ambiguous retries, and
+monetary overflow—are addressed by the transactional update, persistent idempotency record, exact
+parsing, and integration tests. The following boundaries were deliberately left outside this
+time-boxed implementation:
+
+| Area | Current boundary | Production direction |
+|---|---|---|
+| Database concurrency | SQLite serializes every writer. The tests demonstrate safety, not production throughput. | Use PostgreSQL with a managed connection pool. Requests for one account must still contend on its balance row, while unrelated accounts can progress concurrently. Re-run the concurrency tests against PostgreSQL's isolation and locking behaviour. |
+| Execution model | The complete batch is parsed into memory and processed synchronously in one HTTP request and database transaction. Transaction and lock duration grow with batch size. | Bound the synchronous path. If much larger batches are required, introduce a durable asynchronous job and status model while preserving batch atomicity and idempotency. |
+| Capacity limits | Request size, transfer count, and string lengths are unbounded. | Configure HTTP-body, batch, and field limits from measured throughput and latency objectives; reject early and test every boundary. |
+| Schema evolution | Startup `CREATE TABLE IF NOT EXISTS` is exercise scaffolding. It cannot evolve existing tables or add constraints to an existing supplied schema. | Use ordered, versioned migrations outside application startup, including reviewed constraints and indexes. |
+| Idempotency lifecycle | Keys are globally scoped and retained forever. | Scope keys to the authenticated tenant, retain them for at least the client retry window, and remove them through a monitored cleanup policy. |
+| Failure handling | SQLite has a busy timeout, but database failures are not classified and there is no explicit retry policy. | Configure pool and statement timeouts; retry only known transient serialization/deadlock failures inside the idempotent boundary; add readiness checks and graceful shutdown. |
+| Observability and audit | Only basic server logging is present. | Add structured logs, traces, and metrics for request latency, result status, batch size, idempotency replay/conflict, transaction duration, lock wait, rollback, and database errors. Add a financial audit trail while excluding sensitive account data from telemetry. |
+| API ergonomics | Errors have stable codes but no structured field details or correlation identifier; success has no response body. | Add field paths for actionable validation errors and correlation identifiers. Consider returning a batch resource identifier without exposing a balance that may immediately become stale. |
+| Bank identifiers | BIC and IBAN values are normalized and required to be non-empty, but their structure, country-specific length, checksum, and real-world existence are not validated. Account lookup still establishes whether the organization identifiers belong to a known account. | Use a maintained standards-aware validator for request syntax and authoritative reference data where existence checks are required, especially before persisting counterparty identifiers. |
+| Security | Authentication, authorization, rate limiting, and account-enumeration policy are outside the supplied scope. | Derive account identity from the authenticated principal and apply tenant authorization, abuse controls, and the platform's non-enumeration policy. |
+| Delivery | The current setup targets local `mise`/sbt execution. | Provide a Dockerfile and Compose environment for the application and PostgreSQL, then run build, unit, integration, and contract checks in CI. |
+| Production verification | Integration tests use SQLite and deterministic in-process HTTP calls. | Add PostgreSQL/Testcontainers coverage, OpenAPI contract checks, load tests, and fault injection around connection loss, process termination, and ambiguous commits. |
+| Monetary scope | The contract supports EUR and signed 64-bit cents only. | Introduce a currency-aware money model and a matching wider database representation only if future product requirements exceed that range or add currencies. |

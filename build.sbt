@@ -9,6 +9,7 @@ val doobieVersion = "1.0.0-RC13"
 lazy val root = (project in file("."))
   .settings(
     name := "bulk-transfers",
+    Compile / run / fork := true,
     scalacOptions ++= Seq(
       "-deprecation",
       "-feature",

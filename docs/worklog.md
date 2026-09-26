@@ -11,11 +11,10 @@ Breaks, unrelated interruptions, and unattended download/build time are excluded
 - **Goal:** Extract the contract, discrepancies, assumptions, risks, and acceptance criteria without
   selecting an implementation architecture.
 - **Inputs reviewed:** PDF brief, supplementary exercise instructions, supplied README/OpenAPI, both JSON samples, SQLite
-  schema and contents, and a company's card-processor engineering article.
+  schema and contents, and a card-processor engineering article from the domain source.
 - **Evidence gathered:**
   - Scala is explicitly approved in the supplementary exercise instructions.
   - The account starts with `10,000,000` cents.
-  - `sample1.json` totals €62,251.50; `sample2.json` totals €106,482.16.
   - The existing transactions sum to the current balance.
   - The sample database has no declared indexes beyond row IDs, foreign keys, `NOT NULL`
     constraints, or financial check constraints; it is illustrative rather than canonical.
@@ -75,3 +74,14 @@ response bodies remain open. Time awaiting review is not counted as active proje
   successful financial effect remains permanently replayable for the key's retention period.
 - For a production database, replace the direct DriverManager transactor with a managed, pool-backed
   transactor; the direct SQLite connection is proportionate for this exercise.
+
+## Sprint 4 — Submission polish
+
+- **Active time:** Approximately 30–40m
+- **Goal:** Close the highest-value contract and usability and documentation gaps without broadening the
+  architecture.
+- **Scope:** Exact-balance, malformed-JSON, and empty-batch HTTP tests; clearer run instructions;
+  an OpenAPI contract; and concise documentation of the remaining production limitations.
+- **Outcome:** Complete. The submission now has focused boundary coverage, a reproducible manual
+  demo, an OpenAPI contract with examples, and an explicit record of deliberately deferred
+  production concerns.

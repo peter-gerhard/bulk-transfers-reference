@@ -4,9 +4,9 @@ import cats.effect.IO
 import cats.effect.unsafe.implicits.global
 import challenge.api.TransferRoutes
 import challenge.persistence.{Database, SqliteTransferRepository}
-import io.circe.parser.parse
+import io.circe.{Json, parser}
 import java.nio.file.Files
-import org.http4s.{Header, Method, Request, Status, Uri}
+import org.http4s.{Header, Method, Request, Response, Status, Uri}
 import org.http4s.circe.CirceEntityCodec._
 import org.typelevel.ci.CIString
 import org.typelevel.doobie.Transactor
@@ -18,7 +18,7 @@ class WalkingSliceSuite extends munit.FunSuite {
       val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
       val request = Request[IO](Method.POST, Uri.unsafeFromString("/transfers/bulk"))
         .putHeaders(Header.Raw(CIString("Idempotency-Key"), "walking-slice-1"))
-        .withEntity(parse(validRequest).toOption.get)
+        .withEntity(parser.parse(validRequest).toOption.get)
 
       for {
         response <- app.run(request)
@@ -37,16 +37,82 @@ class WalkingSliceSuite extends munit.FunSuite {
       val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
       val request = Request[IO](Method.POST, Uri.unsafeFromString("/transfers/bulk"))
         .putHeaders(Header.Raw(CIString("Idempotency-Key"), "walking-slice-2"))
-        .withEntity(parse(validRequest.replace("14.5", "100.01")).toOption.get)
+        .withEntity(parser.parse(validRequest.replace("14.5", "100.01")).toOption.get)
 
       for {
         response <- app.run(request)
+        error <- errorCode(response)
         balance <- sql"SELECT balance_cents FROM bank_accounts WHERE id = 1".query[Long].unique.transact(transactor)
         transactionCount <- sql"SELECT COUNT(*) FROM transactions".query[Long].unique.transact(transactor)
       } yield {
         assertEquals(response.status, Status.UnprocessableContent)
+        assertEquals(error, "insufficient_funds")
         assertEquals(balance, 10000L)
         assertEquals(transactionCount, 0L)
+      }
+    }
+  }
+
+  test("a batch spending the exact balance is accepted") {
+    withDatabase { transactor =>
+      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val request = bulkRequest(validRequest.replace("14.5", "99.5"), "exact-balance")
+
+      for {
+        response <- app.run(request)
+        balance <- sql"SELECT balance_cents FROM bank_accounts WHERE id = 1".query[Long].unique.transact(transactor)
+        transactions <- sql"SELECT amount_cents FROM transactions ORDER BY id".query[Long].to[List].transact(transactor)
+      } yield {
+        assertEquals(response.status, Status.Created)
+        assertEquals(balance, 0L)
+        assertEquals(transactions, List(-9950L, -50L))
+      }
+    }
+  }
+
+  test("malformed JSON returns 400 without reserving the idempotency key") {
+    withDatabase { transactor =>
+      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val request = Request[IO](Method.POST, Uri.unsafeFromString("/transfers/bulk"))
+        .withEntity("{\"organization_bic\":")
+        .putHeaders(
+          Header.Raw(CIString("Content-Type"), "application/json"),
+          Header.Raw(CIString("Idempotency-Key"), "malformed-json")
+        )
+
+      for {
+        response <- app.run(request)
+        error <- errorCode(response)
+        balance <- sql"SELECT balance_cents FROM bank_accounts WHERE id = 1".query[Long].unique.transact(transactor)
+        transactionCount <- sql"SELECT COUNT(*) FROM transactions".query[Long].unique.transact(transactor)
+        idempotencyCount <- sql"SELECT COUNT(*) FROM idempotency_requests".query[Long].unique.transact(transactor)
+      } yield {
+        assertEquals(response.status, Status.BadRequest)
+        assertEquals(error, "invalid_request_body")
+        assertEquals(balance, 10000L)
+        assertEquals(transactionCount, 0L)
+        assertEquals(idempotencyCount, 0L)
+      }
+    }
+  }
+
+  test("an empty transfer batch returns 400 without reserving the idempotency key") {
+    withDatabase { transactor =>
+      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val request = bulkRequest(emptyBatchRequest, "empty-batch")
+
+      for {
+        response <- app.run(request)
+        error <- errorCode(response)
+        balance <- sql"SELECT balance_cents FROM bank_accounts WHERE id = 1".query[Long].unique.transact(transactor)
+        transactionCount <- sql"SELECT COUNT(*) FROM transactions".query[Long].unique.transact(transactor)
+        idempotencyCount <- sql"SELECT COUNT(*) FROM idempotency_requests".query[Long].unique.transact(transactor)
+      } yield {
+        assertEquals(response.status, Status.BadRequest)
+        assertEquals(error, "invalid_request")
+        assertEquals(balance, 10000L)
+        assertEquals(transactionCount, 0L)
+        assertEquals(idempotencyCount, 0L)
       }
     }
   }
@@ -56,14 +122,16 @@ class WalkingSliceSuite extends munit.FunSuite {
       val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
       val request = Request[IO](Method.POST, Uri.unsafeFromString("/transfers/bulk"))
         .putHeaders(Header.Raw(CIString("Idempotency-Key"), "walking-slice-3"))
-        .withEntity(parse(validRequest.replace("demo bic", "unknown bic")).toOption.get)
+        .withEntity(parser.parse(validRequest.replace("demo bic", "unknown bic")).toOption.get)
 
       for {
         response <- app.run(request)
+        error <- errorCode(response)
         balance <- sql"SELECT balance_cents FROM bank_accounts WHERE id = 1".query[Long].unique.transact(transactor)
         transactionCount <- sql"SELECT COUNT(*) FROM transactions".query[Long].unique.transact(transactor)
       } yield {
         assertEquals(response.status, Status.NotFound)
+        assertEquals(error, "account_not_found")
         assertEquals(balance, 10000L)
         assertEquals(transactionCount, 0L)
       }
@@ -74,18 +142,22 @@ class WalkingSliceSuite extends munit.FunSuite {
     withDatabase { transactor =>
       val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
       val request = Request[IO](Method.POST, Uri.unsafeFromString("/transfers/bulk"))
-        .withEntity(parse(validRequest).toOption.get)
+        .withEntity(parser.parse(validRequest).toOption.get)
       val requestWithBlankKey = request.putHeaders(Header.Raw(CIString("Idempotency-Key"), "  "))
 
       for {
         missingKeyResponse <- app.run(request)
         blankKeyResponse <- app.run(requestWithBlankKey)
+        missingKeyError <- errorCode(missingKeyResponse)
+        blankKeyError <- errorCode(blankKeyResponse)
         balance <- sql"SELECT balance_cents FROM bank_accounts WHERE id = 1".query[Long].unique.transact(transactor)
         transactionCount <- sql"SELECT COUNT(*) FROM transactions".query[Long].unique.transact(transactor)
         idempotencyCount <- sql"SELECT COUNT(*) FROM idempotency_requests".query[Long].unique.transact(transactor)
       } yield {
         assertEquals(missingKeyResponse.status, Status.BadRequest)
         assertEquals(blankKeyResponse.status, Status.BadRequest)
+        assertEquals(missingKeyError, "idempotency_key_required")
+        assertEquals(blankKeyError, missingKeyError)
         assertEquals(balance, 10000L)
         assertEquals(transactionCount, 0L)
         assertEquals(idempotencyCount, 0L)
@@ -144,11 +216,13 @@ class WalkingSliceSuite extends munit.FunSuite {
       for {
         firstResponse <- app.run(firstRequest)
         conflictResponse <- app.run(conflictingRequest)
+        conflictError <- errorCode(conflictResponse)
         balance <- sql"SELECT balance_cents FROM bank_accounts WHERE id = 1".query[Long].unique.transact(transactor)
         transactionCount <- sql"SELECT COUNT(*) FROM transactions".query[Long].unique.transact(transactor)
       } yield {
         assertEquals(firstResponse.status, Status.Created)
         assertEquals(conflictResponse.status, Status.Conflict)
+        assertEquals(conflictError, "idempotency_key_conflict")
         assertEquals(balance, 8500L)
         assertEquals(transactionCount, 2L)
       }
@@ -269,7 +343,17 @@ class WalkingSliceSuite extends munit.FunSuite {
   private def bulkRequest(body: String, idempotencyKey: String): Request[IO] =
     Request[IO](Method.POST, Uri.unsafeFromString("/transfers/bulk"))
       .putHeaders(Header.Raw(CIString("Idempotency-Key"), idempotencyKey))
-      .withEntity(parse(body).toOption.get)
+      .withEntity(parser.parse(body).toOption.get)
+
+  private def errorCode(response: Response[IO]): IO[String] =
+    response.as[Json].flatMap(json => IO.fromEither(json.hcursor.get[String]("code")))
+
+  private val emptyBatchRequest =
+    """{
+      |  "organization_bic": "demo bic",
+      |  "organization_iban": "fr76 1234",
+      |  "credit_transfers": []
+      |}""".stripMargin
 
   private val validRequest =
     """{
