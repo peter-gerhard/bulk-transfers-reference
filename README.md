@@ -30,10 +30,12 @@ The flow is deliberately small:
 HTTP/JSON -> pure normalization and validation -> one transactional batch operation -> HTTP result
 ```
 
-The database operation conditionally debits the account and inserts every negative ledger entry in
-one transaction. HTTP and persistence are separated because they change for different reasons;
-additional layers or per-class interfaces would not yet earn their complexity. Idempotency replay,
-concurrency verification, and operational limits remain Sprint 3 work.
+The database operation binds the idempotency key, conditionally debits the account, inserts every
+negative ledger entry, and records successful completion in one transaction. Integration tests
+cover duplicate retries, competing spends, and rollback after a mid-batch failure. HTTP and
+persistence are separated because they change for different reasons; additional layers or
+per-class interfaces would not yet earn their complexity. Operational limits remain an open
+production decision.
 
 ## Method
 
@@ -91,12 +93,24 @@ schema change, not only a different Scala type.
 ## Idempotency semantics
 
 - Every request requires an `Idempotency-Key` supplied by the client.
-- The key, request identity, and terminal outcome are persisted as part of processing the batch.
-- Retrying the same key with the same request replays the original outcome without applying another
-  debit.
-- Reusing a key with a different request returns `409 Conflict`.
+- Once a valid request reaches processing, its key remains bound to a fingerprint of the normalized
+  request. Reusing that key for different content returns `409 Conflict`.
+- A successful outcome is persisted in the same transaction as the debit and transfer rows.
+  Retrying the same key and request then replays `201` without applying another debit.
+- `404` and `422` are state-dependent, non-mutating outcomes rather than permanently cached
+  results. A retry with the same key and request re-evaluates them because the account may have been
+  created or credited in the meantime.
+- Requests rejected with `400` do not reserve the key because processing has not begun.
 - A request fingerprint may detect key misuse, but is never used to deduplicate requests that have
   different keys.
+
+For an accepted batch, one database transaction claims the unique idempotency key, conditionally
+updates the account balance, inserts one row per transfer into `transactions`, and marks the key as
+successfully completed. Keeping these writes together closes crash windows between recording the
+key and applying the financial effect. It also means transaction duration grows with batch size.
+SQLite serializes writers, so this is a scalability limit of the exercise setup; a production
+database can allow unrelated accounts and keys to proceed concurrently, while requests against the
+same account must still contend on that account's balance.
 
 ## Open decisions
 
@@ -109,6 +123,8 @@ schema change, not only a different Scala type.
 - **Database invariants:** The supplied SQLite schema has few constraints. The solution may strengthen
   its own schema or migrations where an invariant can be defended; the sample schema is not treated
   as immutable or canonical.
+- **Idempotency retention:** Stored keys need an expiry and cleanup policy in production. Its duration
+  should follow the client's maximum retry window rather than an arbitrary exercise value.
 
 ## Acceptance criteria
 
@@ -134,3 +150,5 @@ schema change, not only a different Scala type.
 - Rounding or overflow in monetary parsing and aggregation.
 - Assuming SQLite locking behaviour is equivalent to a production relational database.
 - Excessive transaction duration or resource use for an unbounded batch.
+- SQLite's single-writer model is not representative of the concurrency available from a
+  production relational database.

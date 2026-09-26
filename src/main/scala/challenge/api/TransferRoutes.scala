@@ -15,17 +15,18 @@ final class TransferRoutes(repository: TransferRepository) {
     case request @ POST -> Root / "transfers" / "bulk" =>
       validateIdempotencyKey(request.headers.get(IdempotencyKey).map(_.head.value)) match {
         case Left(error) => BadRequest(errorJson(error))
-        case Right(_) =>
+        case Right(idempotencyKey) =>
           request.attemptAs[BulkTransferRequest].value.flatMap {
             case Left(_) => BadRequest(errorJson("request body is not valid JSON for this endpoint"))
             case Right(raw) =>
               BulkTransferRequest.validate(raw) match {
                 case Left(error) => BadRequest(errorJson(error))
                 case Right(batch) =>
-                  repository.process(batch).flatMap {
+                  repository.process(idempotencyKey, batch).flatMap {
                     case ProcessingResult.Accepted          => Created()
                     case ProcessingResult.InsufficientFunds => UnprocessableContent(errorJson("insufficient funds"))
                     case ProcessingResult.UnknownAccount    => NotFound(errorJson("account not found"))
+                    case ProcessingResult.KeyConflict       => Conflict(errorJson("idempotency key reused for another request"))
                   }
               }
           }

@@ -3,16 +3,21 @@ package challenge.persistence
 import cats.effect.IO
 import org.typelevel.doobie.Transactor
 import org.typelevel.doobie.implicits._
+import org.sqlite.SQLiteConfig
 
 object Database {
-  def transactor(path: String): Transactor[IO] =
+  def transactor(path: String): Transactor[IO] = {
+    val config = new SQLiteConfig()
+    config.setBusyTimeout(5000)
+    config.enforceForeignKeys(true)
+
     Transactor.fromDriverManager[IO](
       driver = "org.sqlite.JDBC",
       url = s"jdbc:sqlite:$path",
-      user = "",
-      password = "",
+      info = config.toProperties,
       logHandler = None
     )
+  }
 
   def initialize(transactor: Transactor[IO]): IO[Unit] = {
     val schema = for {
@@ -36,6 +41,13 @@ object Database {
           amount_currency TEXT NOT NULL CHECK (amount_currency = 'EUR'),
           bank_account_id INTEGER NOT NULL REFERENCES bank_accounts(id),
           description TEXT NOT NULL
+        )
+      """.update.run
+      _ <- sql"""
+        CREATE TABLE IF NOT EXISTS idempotency_requests (
+          idempotency_key TEXT PRIMARY KEY,
+          request_fingerprint TEXT NOT NULL,
+          completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1))
         )
       """.update.run
     } yield ()

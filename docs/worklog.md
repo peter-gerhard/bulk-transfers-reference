@@ -50,10 +50,28 @@ response bodies remain open. Time awaiting review is not counted as active proje
 - **Outcome:** Complete. The executable walking slice establishes the minimum architecture needed
   to test the contract while leaving concurrency and retry hardening for Sprint 3.
 
-## Sprint 3 note
+## Sprint 3 — Retry and concurrency correctness
 
-Evaluate whether `ETag`/`If-Match` adds useful optimistic concurrency semantics. Keep it distinct
-from `Idempotency-Key`: a version precondition can detect stale account state, but cannot safely
-replay a request after its response is lost. For a production database, replace the direct
-DriverManager transactor with a managed, pool-backed transactor; the direct SQLite connection is
-proportionate for this exercise.
+- **Active time:** Approximately 30m
+- **Goal:** Make ambiguous retries safe and prove the financial invariants under concurrency and
+  mid-transaction failure.
+- **Scope:** Persistent idempotency-key binding, normalized request fingerprints, successful-result
+  replay, state-dependent retry behavior, concurrent spending, and rollback verification.
+- **Current checkpoint:** The key reservation and successful result now share the financial
+  transaction. Integration tests cover replay without duplicate effects, key conflicts, changing
+  account state between retries, concurrent spending, and rollback after a forced insertion error.
+- **Outcome:** Complete. Successful effects are replayable without duplication; state-dependent
+  failures are re-evaluated; and the concurrency and rollback invariants are covered by executable
+  tests.
+
+### Decisions and future improvements
+
+- Do not add `ETag`/`If-Match`. A version precondition could detect stale account state, but the bulk
+  endpoint is a command and the client has no account representation to condition it on. It also
+  cannot determine whether an earlier request committed after its response was lost. The
+  `Idempotency-Key` and conditional database update address those separate concerns more directly.
+- Do not permanently replay state-dependent `404` or `422` outcomes. A same-key, same-request retry
+  should re-evaluate them because an account may be created or credited between attempts. A
+  successful financial effect remains permanently replayable for the key's retention period.
+- For a production database, replace the direct DriverManager transactor with a managed, pool-backed
+  transactor; the direct SQLite connection is proportionate for this exercise.
