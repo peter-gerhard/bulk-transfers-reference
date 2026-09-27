@@ -1,21 +1,46 @@
 package challenge
 
-import cats.effect.IO
+import cats.effect.{IO, Resource}
 import cats.effect.unsafe.implicits.global
 import challenge.api.TransferRoutes
-import challenge.persistence.{Database, SqliteTransferRepository}
+import challenge.persistence.{Database, PostgresTransferRepository}
 import io.circe.{Json, parser}
-import java.nio.file.Files
 import org.http4s.{Header, Method, Request, Response, Status, Uri}
 import org.http4s.circe.CirceEntityCodec._
+import org.testcontainers.postgresql.PostgreSQLContainer
 import org.typelevel.ci.CIString
-import org.typelevel.doobie.Transactor
+import org.typelevel.doobie.hikari.HikariTransactor
+import org.typelevel.doobie.{Transactor, hikari}
 import org.typelevel.doobie.implicits._
 
 class BulkTransferIntegrationSuite extends munit.FunSuite {
+  private val postgres = new PostgreSQLContainer("postgres:17-alpine")
+    .withDatabaseName("bulk_transfers_test")
+    .withUsername("challenge")
+    .withPassword("challenge")
+    .withInitScript("schema.sql")
+
+  private var transactor: hikari.HikariTransactor[IO] = _
+  private var releaseTransactor: IO[Unit] = IO.unit
+
+  override def beforeAll(): Unit = {
+    postgres.start()
+    val resource: Resource[IO, HikariTransactor[IO]] = Database.transactor(
+      Database.Config(postgres.getJdbcUrl, postgres.getUsername, postgres.getPassword)
+    )
+    val allocated: (HikariTransactor[IO], IO[Unit]) = resource.allocated.unsafeRunSync()
+    transactor = allocated._1
+    releaseTransactor = allocated._2
+  }
+
+  override def afterAll(): Unit = {
+    releaseTransactor.unsafeRunSync()
+    postgres.stop()
+  }
+
   test("an affordable HTTP batch debits the account and persists every transfer") {
     withDatabase { transactor =>
-      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val app = new TransferRoutes(new PostgresTransferRepository(transactor)).routes.orNotFound
       val request = Request[IO](Method.POST, Uri.unsafeFromString("/transfers/bulk"))
         .putHeaders(Header.Raw(CIString("Idempotency-Key"), "walking-slice-1"))
         .withEntity(parser.parse(validRequest).toOption.get)
@@ -34,7 +59,7 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
 
   test("an unaffordable HTTP batch returns 422 without changing financial state") {
     withDatabase { transactor =>
-      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val app = new TransferRoutes(new PostgresTransferRepository(transactor)).routes.orNotFound
       val request = Request[IO](Method.POST, Uri.unsafeFromString("/transfers/bulk"))
         .putHeaders(Header.Raw(CIString("Idempotency-Key"), "walking-slice-2"))
         .withEntity(parser.parse(validRequest.replace("14.5", "100.01")).toOption.get)
@@ -55,7 +80,7 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
 
   test("a batch spending the exact balance is accepted") {
     withDatabase { transactor =>
-      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val app = new TransferRoutes(new PostgresTransferRepository(transactor)).routes.orNotFound
       val request = bulkRequest(validRequest.replace("14.5", "99.5"), "exact-balance")
 
       for {
@@ -72,7 +97,7 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
 
   test("malformed JSON returns 400 without reserving the idempotency key") {
     withDatabase { transactor =>
-      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val app = new TransferRoutes(new PostgresTransferRepository(transactor)).routes.orNotFound
       val request = Request[IO](Method.POST, Uri.unsafeFromString("/transfers/bulk"))
         .withEntity("{\"organization_bic\":")
         .putHeaders(
@@ -98,7 +123,7 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
 
   test("an empty transfer batch returns 400 without reserving the idempotency key") {
     withDatabase { transactor =>
-      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val app = new TransferRoutes(new PostgresTransferRepository(transactor)).routes.orNotFound
       val request = bulkRequest(emptyBatchRequest, "empty-batch")
 
       for {
@@ -119,7 +144,7 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
 
   test("an unknown account returns 404 without changing financial state") {
     withDatabase { transactor =>
-      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val app = new TransferRoutes(new PostgresTransferRepository(transactor)).routes.orNotFound
       val request = Request[IO](Method.POST, Uri.unsafeFromString("/transfers/bulk"))
         .putHeaders(Header.Raw(CIString("Idempotency-Key"), "walking-slice-3"))
         .withEntity(parser.parse(validRequest.replace("demo bic", "unknown bic")).toOption.get)
@@ -140,7 +165,7 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
 
   test("a missing or blank idempotency key returns 400 without changing financial state") {
     withDatabase { transactor =>
-      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val app = new TransferRoutes(new PostgresTransferRepository(transactor)).routes.orNotFound
       val request = Request[IO](Method.POST, Uri.unsafeFromString("/transfers/bulk"))
         .withEntity(parser.parse(validRequest).toOption.get)
       val requestWithBlankKey = request.putHeaders(Header.Raw(CIString("Idempotency-Key"), "  "))
@@ -167,7 +192,7 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
 
   test("retrying a completed request replays 201 without applying another debit") {
     withDatabase { transactor =>
-      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val app = new TransferRoutes(new PostgresTransferRepository(transactor)).routes.orNotFound
       val firstRequest = bulkRequest(validRequest, "idempotent-success")
       val equivalentRetry = bulkRequest(validRequest.replace("14.5", "14.50"), "idempotent-success")
 
@@ -191,7 +216,7 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
 
   test("concurrent duplicate requests apply their financial effect once") {
     withDatabase { transactor =>
-      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val app = new TransferRoutes(new PostgresTransferRepository(transactor)).routes.orNotFound
       val request = bulkRequest(validRequest, "concurrent-duplicate")
 
       for {
@@ -209,7 +234,7 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
 
   test("reusing a completed key for another request returns 409") {
     withDatabase { transactor =>
-      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val app = new TransferRoutes(new PostgresTransferRepository(transactor)).routes.orNotFound
       val firstRequest = bulkRequest(validRequest, "conflicting-key")
       val conflictingRequest = bulkRequest(validRequest.replace("14.5", "14.6"), "conflicting-key")
 
@@ -231,7 +256,7 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
 
   test("retrying an insufficient-funds request re-evaluates the current balance") {
     withDatabase { transactor =>
-      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val app = new TransferRoutes(new PostgresTransferRepository(transactor)).routes.orNotFound
       val request = bulkRequest(validRequest.replace("14.5", "100.01"), "funds-can-change")
       val conflictingRequest = bulkRequest(validRequest.replace("14.5", "100.02"), "funds-can-change")
 
@@ -254,7 +279,7 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
 
   test("retrying an unknown-account request re-evaluates whether the account exists") {
     withDatabase { transactor =>
-      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val app = new TransferRoutes(new PostgresTransferRepository(transactor)).routes.orNotFound
       val request = bulkRequest(validRequest.replace("demo bic", "new bank bic"), "account-can-appear")
 
       for {
@@ -275,7 +300,7 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
 
   test("concurrent requests cannot collectively overdraw an account") {
     withDatabase { transactor =>
-      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val app = new TransferRoutes(new PostgresTransferRepository(transactor)).routes.orNotFound
       val body = validRequest.replace("14.5", "60")
       val firstRequest = bulkRequest(body, "concurrent-1")
       val secondRequest = bulkRequest(body, "concurrent-2")
@@ -294,17 +319,13 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
 
   test("a database failure rolls back the debit, transfers, and idempotency reservation") {
     withDatabase { transactor =>
-      val app = new TransferRoutes(new SqliteTransferRepository(transactor)).routes.orNotFound
+      val app = new TransferRoutes(new PostgresTransferRepository(transactor)).routes.orNotFound
       val request = bulkRequest(validRequest, "rollback-key")
 
       for {
         _ <- sql"""
-          CREATE TRIGGER reject_supplier_b
-          BEFORE INSERT ON transactions
-          WHEN NEW.counterparty_name = 'Supplier B'
-          BEGIN
-            SELECT RAISE(ABORT, 'forced test failure');
-          END
+          ALTER TABLE transactions
+          ADD CONSTRAINT reject_supplier_b CHECK (counterparty_name <> 'Supplier B')
         """.update.run.transact(transactor)
         failedResponse <- app.run(request).attempt
         balanceAfterFailure <- sql"SELECT balance_cents FROM bank_accounts WHERE id = 1".query[Long].unique.transact(transactor)
@@ -312,7 +333,7 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
         keyAfterFailure <- sql"""
           SELECT COUNT(*) FROM idempotency_requests WHERE idempotency_key = 'rollback-key'
         """.query[Long].unique.transact(transactor)
-        _ <- sql"DROP TRIGGER reject_supplier_b".update.run.transact(transactor)
+        _ <- sql"ALTER TABLE transactions DROP CONSTRAINT reject_supplier_b".update.run.transact(transactor)
         retryResponse <- app.run(request)
       } yield {
         assert(failedResponse.isLeft)
@@ -325,10 +346,9 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
   }
 
   private def withDatabase(test: Transactor[IO] => IO[Unit]): Unit = {
-    val path = Files.createTempFile("bulk-transfers-test-", ".sqlite")
-    val transactor = Database.transactor(path.toString)
     val setup = for {
-      _ <- Database.initialize(transactor)
+      _ <- sql"TRUNCATE TABLE transactions, idempotency_requests, bank_accounts RESTART IDENTITY"
+        .update.run.transact(transactor)
       _ <- sql"""
         INSERT INTO bank_accounts (id, organization_name, balance_cents, iban, bic)
         VALUES (1, 'ACME', 10000, 'FR761234', 'DEMOBIC')
@@ -336,8 +356,7 @@ class BulkTransferIntegrationSuite extends munit.FunSuite {
       _ <- test(transactor)
     } yield ()
 
-    try setup.unsafeRunSync()
-    finally Files.deleteIfExists(path)
+    setup.unsafeRunSync()
   }
 
   private def bulkRequest(body: String, idempotencyKey: String): Request[IO] =

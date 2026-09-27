@@ -1,38 +1,19 @@
 # Bulk Transfer Service
 
 Scala 2 implementation of a backend engineering exercise. The solution grew from an explicit behavioural
-contract into a narrow HTTP-to-SQLite slice, then added retry and concurrency correctness without
-expanding the architecture unnecessarily.
+contract into a narrow HTTP-to-SQLite slice, then added retry and concurrency correctness before
+moving the verified persistence boundary to PostgreSQL.
 
 ## Run
 
-The service uses JDK 21, Scala 2.13, and sbt through `mise`:
+The local demo workflow requires Docker Desktop, or another Docker-compatible engine with Compose.
+Colima is not required. Build and start PostgreSQL and the service, then create the explicit demo
+account. The commands use current Docker Compose (`docker compose`); installations exposing the
+standalone command can substitute `docker-compose`.
 
 ```sh
-mise install
-mise exec -- sbt test
-CHALLENGE_DATABASE_PATH=/tmp/bulk-transfers-demo.sqlite mise exec -- sbt run
-```
-
-It listens on port `8080` by default; set `CHALLENGE_PORT` to override it. The database defaults to
-`bulk-transfers.sqlite`; set `CHALLENGE_DATABASE_PATH` to use another path. On an empty database the
-service creates its tables but deliberately does not invent a customer account. Tests create and
-seed an isolated temporary database.
-
-### Manual demo
-
-Start the service with a clean demo database:
-
-```sh
-rm -f /tmp/bulk-transfers-demo.sqlite
-CHALLENGE_DATABASE_PATH=/tmp/bulk-transfers-demo.sqlite mise exec -- sbt run
-```
-
-After the server has started, seed one account from another terminal:
-
-```sh
-sqlite3 /tmp/bulk-transfers-demo.sqlite \
-  "INSERT INTO bank_accounts (id, organization_name, balance_cents, iban, bic) VALUES (1, 'Demo', 10000, 'FR761234', 'DEMOBIC');"
+docker compose up --build -d
+docker compose --profile tools run --rm seed
 ```
 
 Submit a transfer:
@@ -59,19 +40,51 @@ The response is `201 Created`. Repeating the same command with the same idempote
 `201` without applying the debit again. The persisted result can be inspected directly:
 
 ```sh
-sqlite3 /tmp/bulk-transfers-demo.sqlite \
-  "SELECT balance_cents, (SELECT COUNT(*) FROM transactions) FROM bank_accounts WHERE id = 1;"
-# 8550|1
+docker compose exec postgres psql -U challenge -d bulk_transfers -c \
+  "SELECT balance_cents, (SELECT COUNT(*) FROM transactions) FROM bank_accounts WHERE bic = 'DEMOBIC';"
 ```
 
-The integration tests provide broader executable evidence for insufficient funds, validation,
-retry, concurrency, and rollback behaviour.
+Stop the environment and delete its demo data with:
+
+```sh
+docker compose down -v
+```
+
+### Development and tests
+
+The project uses JDK 21, Scala 2.13, and sbt through `mise`. A Docker-compatible engine must be
+running because the integration suite provisions its own disposable PostgreSQL database with
+Testcontainers; the Compose services do not need to be running:
+
+```sh
+mise install
+mise exec -- sbt test
+```
+
+The command above works without additional configuration with Docker Desktop and standard Linux
+Docker installations.
+
+#### If using Colima on macOS (optional)
+
+This section applies only to developers who already use Colima instead of Docker Desktop. Colima
+uses a non-standard socket that must be exposed to Testcontainers:
+
+```sh
+DOCKER_HOST="unix://$HOME/.colima/default/docker.sock" \
+TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock \
+mise exec -- sbt test
+```
+
+The same [`db/schema.sql`](db/schema.sql) initializes both Compose and the test database. The app
+uses `CHALLENGE_DATABASE_URL`, `CHALLENGE_DATABASE_USER`, `CHALLENGE_DATABASE_PASSWORD`, and
+`CHALLENGE_PORT`. Defaults support a PostgreSQL instance on `localhost:5432`; Compose supplies its
+internal database hostname. The schema is deliberately not applied by application startup.
 
 ## Architecture
 
-The service uses http4s/Circe for HTTP and JSON, Cats Effect for resource lifecycle, and doobie
-with the Xerial SQLite driver for persistence. These are established Scala libraries and keep the
-implementation on Scala 2 without introducing an application framework.
+The service uses http4s/Circe for HTTP and JSON, Cats Effect for resource lifecycle, and doobie with
+a resource-managed Hikari pool and PostgreSQL for persistence. These are established Scala
+libraries and keep the implementation on Scala 2 without introducing an application framework.
 
 The flow is deliberately small:
 
@@ -133,8 +146,8 @@ The brief allows a positive decimal string with at most two decimal places. The 
 - reject `.5`, `1.`, `+1`, exponent notation, negative values, and more than two decimal places;
 - reject values outside the exact range supported by persistence.
 
-SQLite `INTEGER` and Scala `Long` are signed 64-bit values. Using non-negative cents gives a maximum
-supported individual amount and balance of `9,223,372,036,854,775,807` cents, or
+PostgreSQL `BIGINT` and Scala `Long` are signed 64-bit values. Using non-negative cents gives a
+maximum supported individual amount and balance of `9,223,372,036,854,775,807` cents, or
 €92,233,720,368,547,758.07. Each amount is range-checked before conversion. The batch total is
 evaluated without overflow; a total above this range cannot be covered by a representable balance and
 therefore follows the insufficient-funds path. Supporting larger balances would require a database
@@ -158,9 +171,9 @@ For an accepted batch, one database transaction claims the unique idempotency ke
 updates the account balance, inserts one row per transfer into `transactions`, and marks the key as
 successfully completed. Keeping these writes together closes crash windows between recording the
 key and applying the financial effect. It also means transaction duration grows with batch size.
-SQLite serializes writers, so this is a scalability limit of the exercise setup; a production
-database can allow unrelated accounts and keys to proceed concurrently, while requests against the
-same account must still contend on that account's balance.
+PostgreSQL allows unrelated accounts and keys to progress concurrently, while requests against the
+same account must still contend on that account's balance row. Batch limits and measured lock time
+are therefore important production controls, not correctness substitutes.
 
 ## Acceptance criteria
 
@@ -187,16 +200,16 @@ time-boxed implementation:
 
 | Area | Current boundary | Production direction |
 |---|---|---|
-| Database concurrency | SQLite serializes every writer. The tests demonstrate safety, not production throughput. | Use PostgreSQL with a managed connection pool. Requests for one account must still contend on its balance row, while unrelated accounts can progress concurrently. Re-run the concurrency tests against PostgreSQL's isolation and locking behaviour. |
+| Database concurrency | PostgreSQL and Hikari allow independent work to proceed concurrently, but updates to the same account serialize on its balance row and large batches hold that lock longer. | Set pool, statement, and lock timeouts from measured load; bound batch size; monitor pool saturation and lock waits; consider partitioning only when actual access patterns justify it. |
 | Execution model | The complete batch is parsed into memory and processed synchronously in one HTTP request and database transaction. Transaction and lock duration grow with batch size. | Bound the synchronous path. If much larger batches are required, introduce a durable asynchronous job and status model while preserving batch atomicity and idempotency. |
 | Capacity limits | Request size, transfer count, and string lengths are unbounded. | Configure HTTP-body, batch, and field limits from measured throughput and latency objectives; reject early and test every boundary. |
-| Schema evolution | Startup `CREATE TABLE IF NOT EXISTS` is exercise scaffolding. It cannot evolve existing tables or add constraints to an existing supplied schema. | Use ordered, versioned migrations outside application startup, including reviewed constraints and indexes. |
+| Schema evolution | A single bootstrap schema is sufficient for fresh Compose and Testcontainers databases but cannot evolve an existing deployment. | Introduce ordered, versioned migrations in the delivery pipeline before the first production schema change. |
 | Idempotency lifecycle | Keys are globally scoped and retained forever. | Scope keys to the authenticated tenant, retain them for at least the client retry window, and remove them through a monitored cleanup policy. |
-| Failure handling | SQLite has a busy timeout, but database failures are not classified and there is no explicit retry policy. | Configure pool and statement timeouts; retry only known transient serialization/deadlock failures inside the idempotent boundary; add readiness checks and graceful shutdown. |
+| Failure handling | Database failures are not classified and there is no explicit retry policy or application readiness endpoint. | Retry only known transient serialization/deadlock failures inside the idempotent boundary; add readiness checks and verify graceful shutdown under load. |
 | Observability and audit | Only basic server logging is present. | Add structured logs, traces, and metrics for request latency, result status, batch size, idempotency replay/conflict, transaction duration, lock wait, rollback, and database errors. Add a financial audit trail while excluding sensitive account data from telemetry. |
 | API ergonomics | Errors have stable codes but no structured field details or correlation identifier; success has no response body. | Add field paths for actionable validation errors and correlation identifiers. Consider returning a batch resource identifier without exposing a balance that may immediately become stale. |
 | Bank identifiers | BIC and IBAN values are normalized and required to be non-empty, but their structure, country-specific length, checksum, and real-world existence are not validated. Account lookup still establishes whether the organization identifiers belong to a known account. | Use a maintained standards-aware validator for request syntax and authoritative reference data where existence checks are required, especially before persisting counterparty identifiers. |
 | Security | Authentication, authorization, rate limiting, and account-enumeration policy are outside the supplied scope. | Derive account identity from the authenticated principal and apply tenant authorization, abuse controls, and the platform's non-enumeration policy. |
-| Delivery | The current setup targets local `mise`/sbt execution. | Provide a Dockerfile and Compose environment for the application and PostgreSQL, then run build, unit, integration, and contract checks in CI. |
-| Production verification | Integration tests use SQLite and deterministic in-process HTTP calls. | Add PostgreSQL/Testcontainers coverage, OpenAPI contract checks, load tests, and fault injection around connection loss, process termination, and ambiguous commits. |
+| Delivery | Docker Compose provides a reproducible local environment, but there is no CI/CD pipeline or production deployment manifest. | Run build, tests, image scanning, migration checks, and contract checks in CI; deploy immutable images with managed secrets and PostgreSQL. |
+| Production verification | Integration tests use real PostgreSQL through Testcontainers and deterministic in-process HTTP calls, but do not cover the containerized HTTP boundary under load. | Add OpenAPI contract checks, end-to-end smoke tests, load tests, and fault injection around connection loss, process termination, and ambiguous commits. |
 | Monetary scope | The contract supports EUR and signed 64-bit cents only. | Introduce a currency-aware money model and a matching wider database representation only if future product requirements exceed that range or add currencies. |

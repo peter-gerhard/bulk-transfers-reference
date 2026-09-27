@@ -23,7 +23,7 @@ trait TransferRepository {
   def process(idempotencyKey: String, batch: TransferBatch): IO[ProcessingResult]
 }
 
-final class SqliteTransferRepository(transactor: Transactor[IO]) extends TransferRepository {
+final class PostgresTransferRepository(transactor: Transactor[IO]) extends TransferRepository {
   import ProcessingResult._
 
   override def process(idempotencyKey: String, batch: TransferBatch): IO[ProcessingResult] =
@@ -73,9 +73,10 @@ final class SqliteTransferRepository(transactor: Transactor[IO]) extends Transfe
 
   private def claimKey(idempotencyKey: String, fingerprint: String): ConnectionIO[Int] =
     sql"""
-      INSERT OR IGNORE INTO idempotency_requests
+      INSERT INTO idempotency_requests
         (idempotency_key, request_fingerprint, completed)
-      VALUES ($idempotencyKey, $fingerprint, 0)
+      VALUES ($idempotencyKey, $fingerprint, FALSE)
+      ON CONFLICT (idempotency_key) DO NOTHING
     """.update.run
 
   private def findKey(idempotencyKey: String): ConnectionIO[Option[(String, Boolean)]] =
@@ -88,8 +89,8 @@ final class SqliteTransferRepository(transactor: Transactor[IO]) extends Transfe
   private def markCompleted(idempotencyKey: String): ConnectionIO[Int] =
     sql"""
       UPDATE idempotency_requests
-      SET completed = 1
-      WHERE idempotency_key = $idempotencyKey AND completed = 0
+      SET completed = TRUE
+      WHERE idempotency_key = $idempotencyKey AND completed = FALSE
     """.update.run
 
   private def findAccount(batch: TransferBatch): ConnectionIO[Option[(Long, Long)]] =

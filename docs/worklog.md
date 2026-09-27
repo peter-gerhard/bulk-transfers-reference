@@ -73,7 +73,7 @@ response bodies remain open. Time awaiting review is not counted as active proje
   should re-evaluate them because an account may be created or credited between attempts. A
   successful financial effect remains permanently replayable for the key's retention period.
 - For a production database, replace the direct DriverManager transactor with a managed, pool-backed
-  transactor; the direct SQLite connection is proportionate for this exercise.
+  transactor; this was subsequently addressed in Sprint 5.
 
 ## Sprint 4 — Submission polish
 
@@ -85,3 +85,15 @@ response bodies remain open. Time awaiting review is not counted as active proje
 - **Outcome:** Complete. The submission now has focused boundary coverage, a reproducible manual
   demo, an OpenAPI contract with examples, and an explicit record of deliberately deferred
   production concerns.
+
+## Sprint 5 — Containerized PostgreSQL
+
+- **Active time:** Approximately 1h 40m
+- **Goal:** Make the service runnable with one standard toolchain and verify persistence semantics
+  against the production-shaped database engine.
+- **Scope:** PostgreSQL, a resource-managed Hikari pool, Testcontainers integration tests, a
+  multi-stage application image, Compose orchestration, and an explicit demo seed command.
+- **Schema decision:** Compose and tests share one bootstrap schema for fresh databases. Versioned
+  migrations are deferred until there is a second schema version to migrate to.
+- **Outcome:** PostgreSQL fully replaces SQLite; Docker is the only reviewer prerequisite; the
+  financial concurrency, idempotency, and rollback tests execute against PostgreSQL.
