@@ -4,6 +4,10 @@ Scala 2 implementation of a backend engineering exercise. The solution grew from
 contract into a narrow HTTP-to-SQLite slice, then added retry and concurrency correctness before
 moving the verified persistence boundary to PostgreSQL.
 
+> **Project status:** This is a personal backend engineering exercise published as a portfolio and
+> reference project. It is not affiliated with or endorsed by any organization and is not intended
+> for production use.
+
 ## Run
 
 The local demo workflow requires Docker Desktop, or another Docker-compatible engine with Compose.
@@ -213,3 +217,7 @@ time-boxed implementation:
 | Delivery | Docker Compose provides a reproducible local environment, but there is no CI/CD pipeline or production deployment manifest. | Run build, tests, image scanning, migration checks, and contract checks in CI; deploy immutable images with managed secrets and PostgreSQL. |
 | Production verification | Integration tests use real PostgreSQL through Testcontainers and deterministic in-process HTTP calls, but do not cover the containerized HTTP boundary under load. | Add OpenAPI contract checks, end-to-end smoke tests, load tests, and fault injection around connection loss, process termination, and ambiguous commits. |
 | Monetary scope | The contract supports EUR and signed 64-bit cents only. | Introduce a currency-aware money model and a matching wider database representation only if future product requirements exceed that range or add currencies. |
+
+## License
+
+No open-source license is provided. All rights are reserved.
