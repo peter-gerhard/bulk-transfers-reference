@@ -8,6 +8,30 @@ moving the verified persistence boundary to PostgreSQL.
 > reference project. It is not affiliated with or endorsed by any organization and is not intended
 > for production use.
 
+## Portfolio highlights
+
+This reference demonstrates how a small financial API can make its correctness boundaries explicit
+and verify them against a production-shaped database engine.
+
+| Capability | Reviewable evidence |
+|---|---|
+| Exact monetary handling | Decimal input is parsed directly into integer cents, with range and aggregate-overflow checks covered by focused tests. |
+| Retry safety | Persistent idempotency-key binding prevents a committed batch from being applied again and rejects reuse for different content. |
+| Concurrency correctness | An atomic conditional debit prevents competing requests from collectively overspending an account. |
+| Transactional failure handling | The debit, ledger entries, and successful idempotency outcome commit or roll back together; integration tests force and verify failure paths. |
+| Production-shaped verification | The integration suite runs against disposable PostgreSQL through Testcontainers, and the application is packaged with Docker Compose. |
+
+**Skills demonstrated:** Scala 2, Cats Effect, http4s, PostgreSQL transactions, idempotent API
+design, concurrency control, exact monetary arithmetic, integration testing, Docker, and technical
+decision documentation.
+
+The permanent baseline is published as the
+[`checkpoint-scala2-correctness`](https://github.com/peter-gerhard/bulk-transfers-reference/releases/tag/checkpoint-scala2-correctness)
+release. The [acceptance criteria](#acceptance-criteria),
+[production limitations](#production-limitations-and-future-improvements), and
+[`BulkTransferIntegrationSuite`](src/test/scala/challenge/BulkTransferIntegrationSuite.scala) provide
+the main review path.
+
 ## Run
 
 The local demo workflow requires Docker Desktop, or another Docker-compatible engine with Compose.
@@ -178,6 +202,20 @@ key and applying the financial effect. It also means transaction duration grows 
 PostgreSQL allows unrelated accounts and keys to progress concurrently, while requests against the
 same account must still contend on that account's balance row. Batch limits and measured lock time
 are therefore important production controls, not correctness substitutes.
+
+## Concurrency and retry alternatives
+
+Idempotency and database concurrency control address separate failure modes. Persistent
+idempotency-key binding handles an ambiguous client retry after a request may already have
+committed. The conditional balance update prevents concurrent requests from making their spending
+decisions against the same stale balance. A database locking strategy on its own would not prevent a
+later retry from applying the same intended operation again.
+
+The selected balance update expresses the funds precondition in one database statement. Credible
+alternatives include pessimistic row locking with `SELECT ... FOR UPDATE`, version-based optimistic
+locking, and serializable transactions. Each has different contention, retry, and complexity
+trade-offs. They are documented rather than maintained as parallel implementations; implementing
+one would be justified when a measured comparison becomes the checkpoint's claim.
 
 ## Acceptance criteria
 
