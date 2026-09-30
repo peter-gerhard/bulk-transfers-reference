@@ -211,11 +211,18 @@ committed. The conditional balance update prevents concurrent requests from maki
 decisions against the same stale balance. A database locking strategy on its own would not prevent a
 later retry from applying the same intended operation again.
 
-The selected balance update expresses the funds precondition in one database statement. Credible
-alternatives include pessimistic row locking with `SELECT ... FOR UPDATE`, version-based optimistic
-locking, and serializable transactions. Each has different contention, retry, and complexity
-trade-offs. They are documented rather than maintained as parallel implementations; implementing
-one would be justified when a measured comparison becomes the checkpoint's claim.
+The selected balance update expresses the funds precondition directly in one database statement.
+The main alternatives considered protect the same invariant at different points in the transaction:
+
+| Approach | How it protects the balance | Main trade-off |
+|---|---|---|
+| Conditional atomic update — selected | Checks sufficient funds and debits the account in one statement. The affected-row count communicates success or insufficient funds. | Concise and specific to this invariant, but competing debits still contend on the account row. |
+| Pessimistic row locking | `SELECT ... FOR UPDATE` locks the account before reading and deciding, so another debit must wait. | Makes the sequence explicit, but holds the lock across more application and database work. |
+| Version-based optimistic locking | Reads a version with the balance and updates only if that version is unchanged. A conflict requires a fresh read and retry. | General-purpose, but requires a version column and retry policy; discarded work increases under contention. |
+
+The conditional update was selected because the sufficient-funds invariant can be represented
+directly without an additional version column or a separate lock-then-decide sequence. All three
+approaches still require a separate idempotency mechanism to make ambiguous client retries safe.
 
 ## Acceptance criteria
 
